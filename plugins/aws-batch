@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""RCC provider for AWS Batch single-container jobs. The job command takes Ref::rcc_params as one argument."""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import uuid
+
+
+ARN = r"arn:(aws[a-z0-9-]*):batch:([a-z0-9-]+):([0-9]{12}):"
+QUEUE = re.compile(ARN + r"job-queue/[A-Za-z0-9_-]{1,128}")
+DEFINITION = re.compile(ARN + r"job-definition/[A-Za-z0-9_-]{1,128}:[1-9][0-9]*")
+JOB_ID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+IN_PROGRESS = {"SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING"}
+# Query only lifecycle metadata. DescribeJobs otherwise includes the container's environment.
+FIELDS = ("jobs[].{id:jobId,name:jobName,queue:jobQueue,definition:jobDefinition,"
+          "state:status,stream:container.logStreamName,exit:container.exitCode}")
+
+
+class UnknownSubmission(Exception):
+    """The request may have reached AWS, but no valid receipt arrived."""
+
+
+def settings(config):
+    if not isinstance(config, dict):
+        raise ValueError("config must be an object")
+    queue = config.get("queue_arn")
+    definition = config.get("job_definition_arn")
+    queue_match = QUEUE.fullmatch(queue) if isinstance(queue, str) else None
+    definition_match = DEFINITION.fullmatch(definition) if isinstance(definition, str) else None
+    if not queue_match or not definition_match or queue_match.groups() != definition_match.groups():
+        raise ValueError("configure queue_arn and a revision-pinned job_definition_arn in the same account and region")
+    seconds = config.get("timeout_seconds")
+    if type(seconds) is not int or not 60 <= seconds <= 2**31 - 1:
+        raise ValueError("timeout_seconds must be a positive 32-bit integer of at least 60 seconds")
+    return queue, definition, seconds, queue_match.group(2)
+
+
+def call_aws(region, operation, arguments, payload=None, job_name=None):
+    """Return a parsed AWS CLI v2 JSON response. A submit is attempted once."""
+    args = ["aws", "batch", operation, "--region", region, "--output", "json",
+            "--cli-connect-timeout", "5", "--cli-read-timeout", "15", *arguments]
+    env = {**os.environ, "AWS_RETRY_MODE": "standard", "AWS_MAX_ATTEMPTS": "1",
+           "AWS_PAGER": "", "AWS_CLI_AUTO_PROMPT": "off"}
+    try:
+        result = subprocess.run(args, input=payload or b"", stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, env=env, timeout=25)
+    except OSError as exc:
+        raise ValueError("AWS CLI could not be started; install AWS CLI v2 on the controller") from exc
+    except subprocess.TimeoutExpired:
+        result = None
+    if result is not None and result.returncode == 0:
+        try:
+            return json.loads(result.stdout)
+        except (UnicodeError, ValueError, RecursionError):
+            pass
+    if result is not None and result.returncode in (252, 253):
+        raise ValueError("AWS CLI rejected its arguments or local credential configuration")
+    if job_name:
+        raise UnknownSubmission(f"AWS submission outcome unknown; check the configured queue for {job_name}")
+    raise ValueError("AWS Batch returned no usable job lookup; check the region, credentials and IAM permissions")
+
+
+def dispatch(request):
+    if not isinstance(request, dict) or type(request.get("protocol")) is not int or request["protocol"] != 1:
+        raise ValueError("expected RCC protocol 1")
+    queue, definition, seconds, region = settings(request.get("config"))
+    action = request.get("action")
+    if action == "status":
+        return {"ok": True, "description": {"workload": "managed-job", "provider": "AWS Batch",
+                "region": region, "timeout_seconds": seconds, "cli_available": shutil.which("aws") is not None,
+                "checked": "local configuration"}}
+    if action in ("plan", "run"):
+        params = request.get("params")
+        if not isinstance(params, dict):
+            raise ValueError("params must contain a JSON object")
+        job_name = "rcc-" + uuid.uuid4().hex
+        payload = {"jobQueue": queue, "jobDefinition": definition, "jobName": job_name,
+                   "parameters": {"rcc_params": json.dumps(params, separators=(",", ":"), allow_nan=False)},
+                   "retryStrategy": {"attempts": 1}, "timeout": {"attemptDurationSeconds": seconds}}
+        wire = json.dumps(payload, separators=(",", ":")).encode()
+        if len(wire) > 30 * 1024:
+            raise ValueError("experiment exceeds the AWS Batch SubmitJob payload limit of 30 KiB")
+        if action == "plan":
+            return {"ok": True, "dry": True, "params": params}
+        receipt = call_aws(region, "submit-job", ["--cli-input-json", "file:///dev/stdin"], wire, job_name)
+        job_id = receipt.get("jobId") if isinstance(receipt, dict) else None
+        if not isinstance(job_id, str) or not JOB_ID.fullmatch(job_id) or receipt.get("jobName") != job_name:
+            raise UnknownSubmission(f"AWS submission receipt invalid; check the configured queue for {job_name}")
+        return {"ok": True, "stride": {"id": job_id, "status": "running", "provider_status": "SUBMITTED"}}
+    if action != "result":
+        raise ValueError("unsupported action")
+    job_id = request.get("id")
+    if not isinstance(job_id, str) or not JOB_ID.fullmatch(job_id):
+        raise ValueError("expected a native AWS Batch job ID")
+    jobs = call_aws(region, "describe-jobs", ["--jobs", job_id, "--query", FIELDS])
+    if not isinstance(jobs, list) or len(jobs) != 1 or not isinstance(jobs[0], dict):
+        raise ValueError("job was not found")
+    job = jobs[0]
+    if (job.get("id") != job_id or job.get("queue") != queue or job.get("definition") != definition
+            or not isinstance(job.get("name"), str) or not re.fullmatch(r"rcc-[0-9a-f]{32}", job["name"])):
+        raise ValueError("job is outside this RCC provider configuration")
+    phase = job.get("state")
+    if phase in IN_PROGRESS:
+        status = "running"
+    elif phase in ("SUCCEEDED", "FAILED"):
+        status = "done" if phase == "SUCCEEDED" else "failed"
+    else:
+        raise ValueError("AWS Batch returned an unknown job state")
+    stride = {"id": job_id, "status": status, "provider_status": phase}
+    if job.get("stream"):
+        stride["log_stream"] = job["stream"]
+    if job.get("exit") is not None:
+        stride["exit_code"] = job["exit"]
+    return {"ok": True, "stride": stride}
+
+
+def main():
+    try:
+        wire = sys.stdin.buffer.read(65537)
+        if len(wire) > 65536:
+            raise ValueError("plugin request exceeds 64 KiB")
+        response = dispatch(json.loads(wire))
+    except UnknownSubmission as exc:
+        response = {"ok": False, "refused": str(exc), "ambiguous": True}
+    except (ValueError, TypeError, RecursionError) as exc:
+        response = {"ok": False, "refused": str(exc)}
+    print(json.dumps(response))
+    return 0 if response["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,17 +1,26 @@
 # RCC · Ruu Compute Controller
 
-RCC gives Ruu a command line for remote experiments. From the machine running the broker, you can see which experiments it accepts, check a proposed run, submit it and look up the result by ID. The first provider uses Google Colab through [RUUF’s compute broker](https://github.com/syn-acc/ruuf/blob/main/ruu-lab/legs/runner.py).
+RCC gives Ruu and its operator one command line for compute. A provider **driver** knows how to run a job on a particular service. A **profile** connects that driver to your own account, queue, endpoint or machine. Choose a profile when you submit an experiment, then use the returned ID to follow it.
+
+| Driver | Where the work runs | What comes back |
+| --- | --- | --- |
+| Colab | RUUF’s existing, metered Google Colab training workflow | Baseline comparison and controller-scored results |
+| Docker | A local engine or remote Docker context, including a home GPU workstation | Container ID, exit status and bounded stdout |
+| RunPod Serverless | A preconfigured queue-based endpoint | Native job state and handler output or result reference |
+| Hugging Face Jobs | An approved container image on a selected hardware flavor | Job state, native job URL and an optional artifact reference |
+| AWS Batch | A configured queue and revision-pinned job definition | Job state, exit code and available CloudWatch log stream |
+
+`./rcc providers` lists installed drivers and configured profiles without contacting any cloud. Colab is the default profile. Configure another provider with the [setup and plugin guide](PROVIDERS.md).
 
 The Colab provider trains and evaluates an open model on a family of tasks. The worker runs on the rented GPU. RUUF keeps the baseline, scores the answers on the controller and enforces the operator’s compute budget. [How the training experiment works](https://github.com/syn-acc/ruuf/blob/main/ruu-lab/child/README.md)
 
-## Try a dry run
+## Try Colab
 
-RCC runs on a Unix system with Python 3. There are no packages to install.
+The controller and Colab client use the Python standard library on Unix. You can run RCC directly from its checkout.
 
 ```sh
 git clone https://github.com/syn-acc/rcc.git
 cd rcc
-chmod +x rcc
 ./rcc --help
 ```
 
@@ -37,8 +46,17 @@ A successful plan returns the normalized parameters and the command the broker w
 
 Replace `RUN_ID` with `stride.id` from the submission. `result` reports the current state and, on completion, the outcome. If the connection drops during submission, check `./rcc status` before trying again. The broker may already have started the run.
 
-## Where this is going
+## Running another provider
 
-The next provider is an operator-owned machine, such as a home GPU workstation. The goal is to take the same experiment file to either provider and bring the result back for scoring. This release supports Colab through an existing RUUF installation. Workstation enrollment and general notebook execution are planned.
+Once you have configured a profile, use the same four commands. Each worker defines the experiment parameters it accepts.
 
-[RUUF](https://github.com/syn-acc/ruuf) is the resident framework that gives Ruu its workspace, memory and research loop. RCC is its independently usable compute client.
+```sh
+rcc status --provider home
+rcc plan --provider home --params experiment.json
+rcc run --provider home --params experiment.json
+rcc result home:NATIVE_ID
+```
+
+A profile-qualified ID goes back to the provider that issued it. Existing Colab IDs continue to work as before. If a submission loses its receipt, check the provider’s job list before resubmitting.
+
+For a system install, run `sudo python3 install.py` from the checkout. This installs RCC and its bundled plugins together. [RUUF](https://github.com/syn-acc/ruuf) owns the resident’s research loop, GPU budget and held-out scoring.

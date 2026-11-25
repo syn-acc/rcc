@@ -1,26 +1,38 @@
 #!/usr/bin/env python3
-"""Submit one request to a RUUF compute broker and print its JSON reply."""
+"""Plan, submit and inspect remote compute jobs through configured providers."""
 import argparse
+import concurrent.futures
 import json
 import os
+import re
 import socket
 import stat
+import subprocess
+from pathlib import Path
 import sys
+import tempfile
 import time
 
 
 REQUEST_LIMIT = 16_384  # The legs broker reads this many bytes per connection.
 REPLY_LIMIT = 1_048_576
 TIMEOUT = 45
+PLUGIN_DIR = Path(__file__).resolve().parent / "plugins"
+NAME = re.compile(r"[a-z][a-z0-9-]{0,47}")
+TRAINING = "ruuf.openrsi.v1"
 
 
 def arguments():
     connection = argparse.ArgumentParser(add_help=False)
     connection.add_argument("--socket", metavar="PATH", default=argparse.SUPPRESS,
                             help="Unix socket (default: RCC_SOCKET or /run/ruu-legs.sock)")
+    connection.add_argument("--config", metavar="FILE", default=argparse.SUPPRESS,
+                            help="operator profiles (default: RCC_CONFIG or /etc/rcc/providers.json)")
     parser = argparse.ArgumentParser(description=__doc__, parents=[connection])
     actions = parser.add_subparsers(dest="command", required=True)
-    actions.add_parser("status", parents=[connection], help="show providers, limits and recent runs")
+    actions.add_parser("providers", parents=[connection], help="list installed drivers and configured profiles offline")
+    status = actions.add_parser("status", parents=[connection], help="show the resident broker or inspect one provider")
+    status.add_argument("--provider", help="inspect one provider profile")
     for name, summary in (("plan", "ask the broker to check an experiment without starting it"),
                           ("run", "submit one experiment")):
         sub = actions.add_parser(name, parents=[connection], help=summary)
@@ -29,6 +41,7 @@ def arguments():
         if name == "run":
             sub.add_argument("--why", metavar="TEXT", help="reason for this experiment (up to 300 characters)")
     result = actions.add_parser("result", parents=[connection], help="look up one run")
+    result.add_argument("--provider", help="look up a native ID in this profile")
     result.add_argument("run_id", metavar="RUN_ID")
     return parser.parse_args()
 
@@ -48,28 +61,13 @@ def read_params(path):
     return params
 
 
-def request_for(args):
-    if args.command == "status":
-        return {"action": "status"}
-    if args.command == "result":
-        return {"action": "result", "id": args.run_id}
-    request = {"action": "stride", "kind": args.provider, "params": read_params(args.params)}
-    if args.command == "plan":
-        request["dry"] = True
-    elif args.why is not None:
-        if len(args.why) > 300:
-            raise ValueError("--why exceeds the broker's 300-character limit")
-        request["why"] = args.why
-    return request
-
-
-def exchange(path, request, launching):
+def exchange(path, request, launching, timeout=TIMEOUT):
     wire = json.dumps(request, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
     if len(wire) > REQUEST_LIMIT:
         raise ValueError("encoded request exceeds the broker's 16 KiB limit")
-    deadline = time.monotonic() + TIMEOUT
+    deadline = time.monotonic() + timeout
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.settimeout(TIMEOUT)
+        client.settimeout(timeout)
         try:
             client.connect(path)
         except OSError as exc:
@@ -103,15 +101,214 @@ def exchange(path, request, launching):
             raise
 
 
+def read_profiles(args):
+    configured = getattr(args, "config", None) or os.environ.get("RCC_CONFIG")
+    path = Path(configured or "/etc/rcc/providers.json")
+    if not configured and not path.exists():
+        return {}
+    with path.open("rb") as stream:
+        raw = stream.read(65_537)
+    if len(raw) > 65_536:
+        raise ValueError("provider configuration exceeds 64 KiB")
+    data = json.loads(raw)
+    profiles = data.get("providers") if isinstance(data, dict) else None
+    if not isinstance(profiles, dict):
+        raise ValueError("configuration needs a providers object")
+    for name, profile in profiles.items():
+        if not NAME.fullmatch(name) or name == "colab" or not isinstance(profile, dict):
+            raise ValueError(f"invalid or reserved provider profile: {name}")
+        driver = profile.get("driver")
+        if not isinstance(driver, str) or not (NAME.fullmatch(driver) or Path(driver).is_absolute()):
+            raise ValueError(f"{name}: driver must be a driver name or absolute executable path")
+        if not isinstance(profile.get("config", {}), dict) or type(profile.get("resident", False)) is not bool:
+            raise ValueError(f"{name}: invalid config or resident setting")
+    return profiles
+
+
+def broker_call(path, kind, request, timeout=TIMEOUT):
+    action = request["action"]
+    if action == "status":
+        return exchange(path, {"action": "status"}, False, timeout)
+    if action == "result":
+        return exchange(path, {"action": "result", "id": request["id"]}, False)
+    wire = {"action": "stride", "kind": kind, "params": request["params"]}
+    if action == "plan":
+        wire["dry"] = True
+    elif action == "run":
+        if "why" in request:
+            wire["why"] = request["why"]
+    else:
+        raise ValueError("unknown broker operation")
+    reply = exchange(path, wire, action == "run")
+    if action == "plan" and reply["ok"] and reply.get("dry") is not True:
+        raise ValueError("broker omitted the dry-run receipt")
+    return reply
+
+
+def plugin_call(driver, config, request, timeout):
+    executable = Path(driver) if Path(driver).is_absolute() else PLUGIN_DIR / driver
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise ValueError(f"provider driver unavailable: {driver}")
+    wire = json.dumps({**request, "protocol": 1, "config": config}, allow_nan=False).encode()
+    # Do not retry a submitted job. A failing plugin can have lost the provider receipt.
+    try:
+        with tempfile.TemporaryFile() as output:
+            proc = subprocess.run([str(executable)], input=wire, stdout=output, stderr=subprocess.DEVNULL,
+                                  env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}, timeout=timeout)
+            output.seek(0)
+            raw = output.read(REPLY_LIMIT + 1)
+        if len(raw) > REPLY_LIMIT:
+            raise ValueError("provider reply exceeds 1 MiB")
+        reply = json.loads(raw)
+        if not isinstance(reply, dict) or type(reply.get("ok")) is not bool:
+            raise ValueError("invalid provider reply")
+        if reply["ok"] and proc.returncode != 0:
+            raise ValueError("provider exited without confirming success")
+    except (subprocess.TimeoutExpired, ValueError, RecursionError) as exc:
+        if request["action"] == "run":
+            return {"ok": False, "ambiguous": True, "refused": "submission outcome unknown; check the provider before resubmitting"}
+        raise ValueError("provider timed out or returned an invalid reply") from exc
+    return reply
+
+
+def qualify(profile, stride):
+    if not isinstance(stride, dict):
+        raise ValueError("provider omitted the run record")
+    native = stride.get("id")
+    if not isinstance(native, str) or not native or len(native) > 512 or not native.isprintable():
+        raise ValueError("provider omitted a valid native run ID")
+    return {**stride, "id": f"{profile}:{native}", "kind": profile}
+
+
+def profile_call(name, profile, request, timeout=TIMEOUT):
+    driver, config = profile["driver"], profile.get("config", {})
+    action = request["action"]
+    if driver in ("colab", "ruuf-broker"):
+        path = config.get("socket", "/run/ruu-legs.sock")
+        kind = "colab" if driver == "colab" else config.get("kind", "colab")
+        if not isinstance(path, str) or not Path(path).is_absolute() or not isinstance(kind, str):
+            raise ValueError(f"{name}: ruuf-broker needs an absolute socket path and an upstream kind")
+        reply = broker_call(path, kind, request, timeout)
+        if reply["ok"] and action == "status":
+            desc = reply["kinds"].get(kind)
+            if not isinstance(desc, dict):
+                raise ValueError(f"{name}: upstream broker does not advertise {kind}")
+            reply = {"ok": True, "description": {**desc, "workload": TRAINING},
+                     **{key: [r for r in reply[key] if r["kind"] == kind] for key in ("running", "recent")}}
+        elif reply["ok"] and action == "result" and reply["stride"].get("kind") != kind:
+            raise ValueError("run belongs to a different broker kind")
+    else:
+        reply = plugin_call(driver, config, request, timeout)
+    if not reply["ok"]:
+        return reply
+    if action == "status":
+        if not isinstance(reply.get("description"), dict):
+            raise ValueError("provider omitted its description")
+        return {**reply, **{key: [qualify(name, r) for r in reply.get(key, [])] for key in ("running", "recent")}}
+    if action == "plan" and reply.get("dry") is not True:
+        raise ValueError("provider omitted the dry-run receipt")
+    if action in ("run", "result"):
+        try:
+            stride = qualify(name, reply.get("stride"))
+        except ValueError:
+            if action == "run":
+                return {"ok": False, "ambiguous": True, "refused": "submission outcome unknown; provider omitted its run ID"}
+            raise
+        if action == "result" and stride["id"] != name + ":" + request["id"]:
+            raise ValueError("provider returned a different run ID")
+        return {**reply, "stride": stride}
+    return reply
+
+
+def resident_status(path, profiles):
+    enrolled = {name: p for name, p in profiles.items() if p.get("resident")}
+    if not profiles:
+        return broker_call(path, "colab", {"action": "status"})
+    errors = {}
+    request = {"action": "status"}
+    # Only enrolled training endpoints are polled on the resident's planning path.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        primary = pool.submit(broker_call, path, "colab", request, 6 if enrolled else TIMEOUT)
+        checks = {name: pool.submit(profile_call, name, profile, request, 6) for name, profile in enrolled.items()}
+        try:
+            reply = primary.result()
+            if not reply["ok"]:
+                raise ValueError(reply.get("refused", "broker refused"))
+        except (OSError, ValueError) as exc:
+            errors["colab"] = str(exc)
+            reply = {"kinds": {}, "running": [], "recent": []}
+        # Configured names address their profile. Never expose native records under a shadowed name.
+        for name in profiles.keys() & reply["kinds"].keys():
+            del reply["kinds"][name]
+            for key in ("running", "recent"):
+                reply[key] = [r for r in reply[key] if r.get("kind") != name]
+        for name, check in checks.items():
+            try:
+                status = check.result()
+                desc = status.get("description", {})
+                if not status["ok"]:
+                    raise ValueError(status.get("refused", "provider refused"))
+                if (desc.get("workload") != TRAINING or not isinstance(desc.get("families"), dict)
+                        or not isinstance(desc.get("params"), dict)):
+                    raise ValueError("provider does not advertise the scored RUUF training workload")
+                reply["kinds"][name] = desc
+                for key in ("running", "recent"):
+                    reply[key].extend(status[key])
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                errors[name] = str(exc)
+    if not reply["kinds"]:
+        return {**reply, "ok": False, "refused": "no training provider available", "provider_errors": errors}
+    return {**reply, "ok": True, "provider_errors": errors}
+
+
+def dispatch(args):
+    profiles = read_profiles(args)
+    path = getattr(args, "socket", None) or os.environ.get("RCC_SOCKET") or "/run/ruu-legs.sock"
+    if args.command == "providers":
+        installed = sorted(p.name for p in PLUGIN_DIR.glob("*")
+                           if NAME.fullmatch(p.name) and p.is_file() and os.access(p, os.X_OK))
+        return {"ok": True, "drivers": ["colab", "ruuf-broker", *installed],
+                "profiles": {"colab": {"driver": "colab", "resident": True},
+                             **{k: {"driver": p["driver"], "resident": p.get("resident", False)} for k, p in profiles.items()}}}
+    name = getattr(args, "provider", None)
+    request = {"action": args.command}
+    if args.command == "status" and name is None:
+        return resident_status(path, profiles)
+    if args.command == "result":
+        if name is None and ":" in args.run_id:
+            name, native = args.run_id.split(":", 1)
+            if name != "colab" and name not in profiles:
+                raise ValueError("unknown provider in run ID")
+        else:
+            native = args.run_id
+        request["id"] = native
+    if args.command in ("plan", "run"):
+        request["params"] = read_params(args.params)
+        if getattr(args, "why", None) is not None:
+            if len(args.why) > 300:
+                raise ValueError("--why exceeds the 300-character limit")
+            request["why"] = args.why
+    if name in profiles:
+        return profile_call(name, profiles[name], request)
+    reply = broker_call(path, name or "colab", request)
+    if args.command == "status" and reply["ok"] and name:
+        if name not in reply["kinds"]:
+            raise ValueError(f"broker does not advertise {name}")
+        return {"ok": True, "description": reply["kinds"][name],
+                **{key: [s for s in reply[key] if s["kind"] == name] for key in ("running", "recent")}}
+    if args.command == "result" and name and reply["ok"] and reply["stride"].get("kind") != name:
+        raise ValueError("result belongs to a different broker kind")
+    return reply
+
+
 def main():
     args = arguments()
-    path = getattr(args, "socket", None) or os.environ.get("RCC_SOCKET") or "/run/ruu-legs.sock"
     try:
-        reply = exchange(path, request_for(args), launching=args.command == "run")
+        reply = dispatch(args)
     except (OSError, ValueError, RecursionError) as exc:
         print(f"rcc: {exc}", file=sys.stderr)
         return 1
-    print(json.dumps(reply, indent=2))
+    print(json.dumps(reply, indent=2, allow_nan=False))
     return 0 if reply["ok"] else 1
 
 

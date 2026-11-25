@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""RCC protocol 1. Launch an operator-pinned container on a Docker context."""
+import json
+import math
+import re
+import subprocess
+import sys
+import uuid
+
+
+LABEL = "org.ruuf.rcc.scope"
+ID = re.compile(r"[0-9a-f]{64}")
+NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,99}")
+LIMIT = 16_384
+TERMINAL = {"exited", "dead", "removing"}
+
+
+def integer(config, key, default, maximum):
+    value = config.get(key, default)
+    if type(value) is not int or not 1 <= value <= maximum:
+        raise ValueError(f"{key} must be a whole number from 1 to {maximum}")
+    return value
+
+
+def profile(config):
+    context, scope = config.get("context"), config.get("scope")
+    if not all(isinstance(x, str) and NAME.fullmatch(x) for x in (context, scope)):
+        raise ValueError("config requires a Docker context and a unique scope name")
+    image, worker = config.get("image"), config.get("entrypoint")
+    if not isinstance(image, str) or not re.fullmatch(r"(?:[a-z0-9][^@\s]*@)?sha256:[0-9a-f]{64}", image):
+        raise ValueError("image must be pinned by repo@sha256 digest or full local image ID")
+    if not isinstance(worker, str) or not worker.startswith("/") or "\0" in worker:
+        raise ValueError("entrypoint must be the absolute path of the approved worker inside the image")
+    args = config.get("args", [])
+    if not isinstance(args, list) or len(args) > 32 or not all(isinstance(v, str) and len(v) <= 4096 and "\0" not in v for v in args):
+        raise ValueError("args must be a list of at most 32 fixed worker arguments")
+    cpus = config.get("cpus", 2)
+    if type(cpus) not in (int, float) or not 0.01 <= cpus <= 1024 or not math.isfinite(cpus):
+        raise ValueError("cpus must be between 0.01 and 1024")
+    gpus = config.get("gpus")
+    if gpus is not None:
+        if isinstance(gpus, int) and not isinstance(gpus, bool):
+            gpus = str(gpus)
+        if not isinstance(gpus, str) or not re.fullmatch(r"all|[1-9][0-9]?|device=[0-9]+(?:,[0-9]+)*", gpus):
+            raise ValueError("gpus must be all, a positive GPU count or device=N[,N...]")
+    network = config.get("network", "none")
+    if not isinstance(network, str) or not NAME.fullmatch(network):
+        raise ValueError("network must name a Docker network")
+    return dict(context=context, scope=scope, image=image, entrypoint=worker, args=args, cpus=cpus,
+                timeout_seconds=integer(config, "timeout_seconds", 600, 604800),
+                memory_mb=integer(config, "memory_mb", 2048, 1_048_576),
+                pids_limit=integer(config, "pids_limit", 256, 65536), gpus=gpus, network=network)
+
+
+def docker(config, args):
+    result = subprocess.run(["docker", "--context", config["context"], *args], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25)
+    if result.returncode:
+        message = result.stderr.decode("utf-8", "replace").strip()[-640:]
+        raise RuntimeError(message or f"Docker exited {result.returncode}")
+    return result.stdout.decode("utf-8", "replace")
+
+
+def containers(config, job_id=None):
+    args = ["container", "ls", "--all", "--no-trunc", "--filter", f"label={LABEL}={config['scope']}"]
+    if job_id:
+        args += ["--filter", "id=" + job_id]
+    else:
+        args += ["--last", "20"]
+    rows = docker(config, args + ["--format", "{{.ID}} {{.Names}} {{.State}}"])
+    runs = []
+    for line in rows.splitlines():
+        ident, name, state = line.split(maxsplit=2)
+        runs.append({"id": ident, "name": name, "container_state": state})
+    return runs
+
+
+def handle(request):
+    if not isinstance(request, dict) or request.get("protocol") != 1 or not isinstance(request.get("config"), dict):
+        raise ValueError("expected RCC protocol 1 and an operator config")
+    c = profile(request["config"])
+    action = request.get("action")
+    if action == "status":
+        known = containers(c)
+        return {"ok": True, "description": {"workload": "container-job", "image": c["image"],
+                "entrypoint": c["entrypoint"], "context": c["context"], "scope": c["scope"],
+                "timeout_seconds": c["timeout_seconds"], "cpus": c["cpus"], "memory_mb": c["memory_mb"],
+                "gpus": c["gpus"], "params": "A JSON object delivered to the fixed worker as RCC_PARAMS_JSON."},
+                "running": [run for run in known if run["container_state"] not in TERMINAL],
+                "recent": [run for run in known if run["container_state"] in TERMINAL]}
+    if action == "result":
+        return result_for(c, request.get("id"))
+    if action not in ("plan", "run"):
+        raise ValueError("unknown RCC action")
+    params = request.get("params")
+    if not isinstance(params, dict):
+        raise ValueError("params must be a JSON object")
+    data = json.dumps(params, allow_nan=False, separators=(",", ":"))
+    if len(data.encode("utf-8")) > LIMIT:
+        raise ValueError("encoded params exceed 16 KiB")
+    if action == "plan":
+        return {"ok": True, "dry": True, "params": params}
+    name = "rcc-" + uuid.uuid4().hex
+    args = ["container", "run", "--detach", "--name", name, "--pull=never", "--restart=no",
+            "--label", f"{LABEL}={c['scope']}", "--memory", f"{c['memory_mb']}m",
+            "--memory-swap", f"{c['memory_mb']}m", "--cpus", str(c["cpus"]), "--pids-limit", str(c["pids_limit"]),
+            "--network", c["network"], "--log-driver", "local", "--log-opt", "max-size=1m",
+            "--log-opt", "max-file=1", "--log-opt", "compress=false", "--env", "RCC_PARAMS_JSON=" + data, "--entrypoint", "/usr/bin/timeout"]
+    if c["gpus"] is not None:
+        selection = c["gpus"]
+        # The Docker --gpus flag parses each individual argument as CSV.
+        args += ["--gpus", f'"{selection}"' if "," in selection else selection]
+    args += ["--", c["image"], "--kill-after=10s", f"{c['timeout_seconds']}s", c["entrypoint"], *c["args"]]
+    try:
+        job_id = docker(c, args).strip()
+        if not ID.fullmatch(job_id):
+            raise ValueError("Docker returned no full container ID")
+    except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+        return {"ok": False, "ambiguous": True, "refused": f"Check the container named {name} before retrying: {exc}",
+                "container_name": name}
+    return {"ok": True, "stride": {"id": job_id, "name": name, "status": "running", "kind": "docker"}}
+
+
+def result_for(c, job_id):
+    if not isinstance(job_id, str) or not ID.fullmatch(job_id):
+        raise ValueError("result requires a full Docker container ID")
+    if not any(row["id"] == job_id for row in containers(c, job_id)):
+        raise ValueError("container is absent from this RCC scope")
+    template = ('{"state":{{json .State.Status}},"exit":{{.State.ExitCode}},'
+                '"oom":{{.State.OOMKilled}},"finished":{{json .State.FinishedAt}}}')
+    state = json.loads(docker(c, ["container", "inspect", "--format", template, job_id]))
+    native = state["state"]
+    finished = native in TERMINAL
+    status = ("done" if native == "exited" and state["exit"] == 0 else "failed") if finished else "running"
+    stride = {"id": job_id, "kind": "docker", "container_state": native, "status": status}
+    if finished:
+        stride.update(exit_code=state["exit"], oom_killed=state["oom"], finished_at=state["finished"])
+        try:
+            stdout = docker(c, ["container", "logs", "--tail", "8", job_id]).encode("utf-8")
+            tail = stdout[-8192:].decode("utf-8", "replace").rstrip()
+            if tail:
+                stride["stdout_tail"] = tail
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            stride["stdout_error"] = str(exc)[:640]
+    return {"ok": True, "stride": stride}
+
+
+if __name__ == "__main__":
+    try:
+        raw = sys.stdin.buffer.read(65_537)
+        if len(raw) > 65_536:
+            raise ValueError("plugin request exceeds 64 KiB")
+        reply = handle(json.loads(raw))
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, RecursionError) as error:
+        reply = {"ok": False, "refused": str(error)[:1000]}
+    print(json.dumps(reply, allow_nan=False))
+    sys.exit(0 if reply["ok"] else 1)

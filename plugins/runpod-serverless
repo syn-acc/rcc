@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""RunPod queue-based Serverless endpoint. See docs.runpod.io/serverless/endpoints/send-requests."""
+
+import http.client
+import json
+
+from _managed_job import Problem, credential, identifier, params_for, serve, token_name
+
+
+STATES = {"IN_QUEUE": "running", "IN_PROGRESS": "running", "COMPLETED": "done",
+          "FAILED": "failed", "CANCELLED": "failed", "TIMED_OUT": "failed"}
+
+
+def call(path, key, payload=None):
+    # HTTPSConnection neither follows redirects nor retries requests.
+    connection = http.client.HTTPSConnection("api.runpod.ai", timeout=15)
+    submit = payload is not None
+    try:
+        body = json.dumps(payload, allow_nan=False).encode() if submit else None
+        headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
+        connection.request("POST" if submit else "GET", path, body=body, headers=headers)
+        response = connection.getresponse()
+        if not 200 <= response.status < 300:
+            ambiguous = submit and (response.status == 408 or response.status >= 500 or 300 <= response.status < 400)
+            raise Problem(f"RunPod returned HTTP {response.status}", ambiguous)
+        raw = response.read(1_048_577)
+        if len(raw) > 1_048_576:
+            raise Problem("RunPod response exceeds 1 MiB", submit)
+        return json.loads(raw)
+    except (http.client.HTTPException, OSError, ValueError, RecursionError):
+        raise Problem("RunPod reply was unavailable or invalid", submit)
+    finally:
+        connection.close()
+
+
+def handle(request):
+    config, action = request["config"], request["action"]
+    endpoint = identifier(config.get("endpoint_id"), "RunPod endpoint_id")
+    token_name(config, "RUNPOD_API_KEY")
+    timeout, ttl = config.get("timeout_seconds", 600), config.get("ttl_seconds", 86400)
+    if type(timeout) is not int or not 5 <= timeout <= 604800:
+        raise Problem("timeout_seconds must be 5 to 604800")
+    if type(ttl) is not int or not max(10, timeout) <= ttl <= 604800:
+        raise Problem("ttl_seconds must cover execution and be 10 to 604800")
+    if action == "status":
+        return {"ok": True, "description": {"workload": "managed-job",
+                "what": "Run the configured RunPod queue handler with params as its input object.",
+                "timeout_seconds": timeout, "ttl_seconds": ttl, "check": "local configuration"}}
+    root = f"/v2/{endpoint}"
+    if action in ("plan", "run"):
+        params = params_for(request)
+        if action == "plan":
+            return {"ok": True, "dry": True, "params": params}
+        payload = {"input": params, "policy": {"executionTimeout": timeout * 1000, "ttl": ttl * 1000}}
+        reply = call(root + "/run", credential(config, "RUNPOD_API_KEY"), payload)
+    else:
+        run_id = identifier(request.get("id"), "RunPod job ID")
+        reply = call(f"{root}/status/{run_id}", credential(config, "RUNPOD_API_KEY"))
+    try:
+        run_id = identifier(reply["id"], "RunPod job ID")
+        if action == "result" and run_id != request["id"]:
+            raise Problem("RunPod returned a different job ID")
+        stage = reply["status"]
+        stride = {"id": run_id, "status": STATES[stage], "provider_status": stage,
+                  "result_ref": f"https://api.runpod.ai{root}/status/{run_id}"}
+    except (KeyError, TypeError, Problem):
+        raise Problem("RunPod returned an invalid job receipt", action == "run")
+    if stage == "COMPLETED" and "output" in reply:
+        # Return larger outputs by reference, keeping broker frames small.
+        if len(json.dumps(reply["output"], ensure_ascii=True)) <= 32_768:
+            stride["output"] = reply["output"]
+    return {"ok": True, "stride": stride}
+
+
+if __name__ == "__main__":
+    raise SystemExit(serve(handle))
