@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Submit one request to a RUUF compute broker and print its JSON reply."""
+import argparse
+import json
+import os
+import socket
+import stat
+import sys
+import time
+
+
+REQUEST_LIMIT = 16_384  # The legs broker reads this many bytes per connection.
+REPLY_LIMIT = 1_048_576
+TIMEOUT = 45
+
+
+def arguments():
+    connection = argparse.ArgumentParser(add_help=False)
+    connection.add_argument("--socket", metavar="PATH", default=argparse.SUPPRESS,
+                            help="Unix socket (default: RCC_SOCKET or /run/ruu-legs.sock)")
+    parser = argparse.ArgumentParser(description=__doc__, parents=[connection])
+    actions = parser.add_subparsers(dest="command", required=True)
+    actions.add_parser("status", parents=[connection], help="show providers, limits and recent runs")
+    for name, summary in (("plan", "ask the broker to check an experiment without starting it"),
+                          ("run", "submit one experiment")):
+        sub = actions.add_parser(name, parents=[connection], help=summary)
+        sub.add_argument("--provider", required=True, help="provider listed by status, e.g. colab")
+        sub.add_argument("--params", required=True, metavar="FILE", help="UTF-8 JSON object")
+        if name == "run":
+            sub.add_argument("--why", metavar="TEXT", help="reason for this experiment (up to 300 characters)")
+    result = actions.add_parser("result", parents=[connection], help="look up one run")
+    result.add_argument("run_id", metavar="RUN_ID")
+    return parser.parse_args()
+
+
+def read_params(path):
+    # Nonblocking open also lets us reject a named pipe with no writer.
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as source:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("--params must name a regular JSON file")
+        raw = source.read(REQUEST_LIMIT + 1)
+    if len(raw) > REQUEST_LIMIT:
+        raise ValueError("parameter file exceeds 16 KiB")
+    params = json.loads(raw.decode("utf-8"))
+    if not isinstance(params, dict):
+        raise ValueError("--params must contain a JSON object")
+    return params
+
+
+def request_for(args):
+    if args.command == "status":
+        return {"action": "status"}
+    if args.command == "result":
+        return {"action": "result", "id": args.run_id}
+    request = {"action": "stride", "kind": args.provider, "params": read_params(args.params)}
+    if args.command == "plan":
+        request["dry"] = True
+    elif args.why is not None:
+        if len(args.why) > 300:
+            raise ValueError("--why exceeds the broker's 300-character limit")
+        request["why"] = args.why
+    return request
+
+
+def exchange(path, request, launching):
+    wire = json.dumps(request, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+    if len(wire) > REQUEST_LIMIT:
+        raise ValueError("encoded request exceeds the broker's 16 KiB limit")
+    deadline = time.monotonic() + TIMEOUT
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(TIMEOUT)
+        try:
+            client.connect(path)
+        except OSError as exc:
+            raise OSError(f"cannot connect to broker at {path}: {exc}") from exc
+        # Once sending begins a lost reply cannot tell us whether the broker launched the job.
+        try:
+            client.sendall(wire)
+            client.shutdown(socket.SHUT_WR)
+            raw = bytearray()
+            while len(raw) <= REPLY_LIMIT:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("broker reply timed out")
+                client.settimeout(remaining)
+                block = client.recv(min(65_536, REPLY_LIMIT + 1 - len(raw)))
+                if not block:
+                    break
+                raw.extend(block)
+            if len(raw) > REPLY_LIMIT:
+                raise ValueError("broker reply exceeded 1 MiB")
+            reply = json.loads(raw.decode("utf-8"))
+            if not isinstance(reply, dict) or not isinstance(reply.get("ok"), bool):
+                raise ValueError("invalid broker reply (expected a JSON object with boolean ok)")
+            if launching and reply["ok"]:
+                if not isinstance(reply.get("stride"), dict) or not reply["stride"].get("id"):
+                    raise ValueError("broker omitted the run ID")
+            return reply
+        except (OSError, ValueError, RecursionError) as exc:
+            if launching:
+                raise ValueError(f"run outcome unknown ({exc}); check rcc status before submitting again") from exc
+            raise
+
+
+def main():
+    args = arguments()
+    path = getattr(args, "socket", None) or os.environ.get("RCC_SOCKET") or "/run/ruu-legs.sock"
+    try:
+        reply = exchange(path, request_for(args), launching=args.command == "run")
+    except (OSError, ValueError, RecursionError) as exc:
+        print(f"rcc: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(reply, indent=2))
+    return 0 if reply["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
