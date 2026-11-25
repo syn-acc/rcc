@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Serve one local RCC Docker profile over a private Unix socket."""
+import argparse
+import errno
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import runpy
+import select
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, suppress
+
+
+RCC = runpy.run_path(str(Path(__file__).resolve().with_name("rcc")))
+MAX_REQUEST = RCC["REQUEST_LIMIT"]
+MAX_REPLY = RCC["REPLY_LIMIT"]
+FIELDS = {"status": {"protocol", "action"}, "plan": {"protocol", "action", "params"},
+          "run": {"protocol", "action", "params", "why"}, "result": {"protocol", "action", "id"}}
+READY = b"RCCD READY\n"
+BOUND = b"RCCD BOUND\n"
+
+
+def checked_request(raw):
+    value = json.loads(raw)
+    if not isinstance(value, dict) or type(value.get("protocol")) is not int or value["protocol"] != 1:
+        raise ValueError("expected RCC worker protocol 1")
+    action = value.get("action")
+    if not isinstance(action, str) or action not in FIELDS or set(value) - FIELDS[action]:
+        raise ValueError("unknown action or unexpected request field")
+    if action in ("run", "plan") and not isinstance(value.get("params"), dict):
+        raise ValueError("params must be an object")
+    if "why" in value and (not isinstance(value["why"], str) or len(value["why"]) > 300):
+        raise ValueError("why must be a string of at most 300 characters")
+    if action == "result" and (not isinstance(value.get("id"), str) or not re.fullmatch("[0-9a-f]{64}", value["id"])):
+        raise ValueError("expected a native Docker container ID")
+    del value["protocol"]
+    return value
+
+
+def read_frame(peer):
+    deadline = time.monotonic() + 5
+    data = bytearray()
+    while len(data) <= MAX_REQUEST:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("request deadline exceeded")
+        peer.settimeout(remaining)
+        part = peer.recv(min(8192, MAX_REQUEST + 1 - len(data)))
+        if not part:
+            return bytes(data)
+        data.extend(part)
+    raise ValueError("request exceeds 16 KiB")
+
+
+def send(peer, reply):
+    data = json.dumps(reply, allow_nan=False, separators=(",", ":")).encode()
+    if len(data) > MAX_REPLY:
+        raise ValueError("provider reply too large")
+    peer.settimeout(3)
+    peer.sendall(data)
+
+
+def serve_peer(peer, config, slots):
+    with peer:
+        launching = False
+        try:
+            request = checked_request(read_frame(peer))
+            launching = request["action"] == "run"
+            # The dispatcher never selects a local driver, executable or profile.
+            reply = RCC["plugin_call"]("docker", config, request, timeout=32)
+            if launching and reply.get("ok"):
+                stride = reply.get("stride")
+                ident = stride.get("id") if isinstance(stride, dict) else None
+                if not isinstance(ident, str) or not re.fullmatch(r"[0-9a-f]{64}", ident):
+                    raise ValueError("worker omitted a native Docker receipt")
+            send(peer, reply)
+        except (OSError, ValueError, TypeError, RecursionError, subprocess.SubprocessError) as exc:
+            failure = {"ok": False, "refused": str(exc)[:500] or "worker request failed"}
+            if launching:
+                failure["ambiguous"] = True
+            with suppress(OSError):
+                send(peer, failure)
+        finally:
+            slots.release()
+
+
+def private_parent(path):
+    if not path.is_absolute() or path.name in ("", ".", "..") or len(os.fsencode(path)) > 103:
+        raise ValueError("use an absolute Unix socket path of at most 103 bytes")
+    parent = path.parent
+    parent.mkdir(mode=0o700, exist_ok=True)
+    info = parent.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise ValueError(f"{parent} must be a private directory owned by the current user")
+
+
+def identity(path):
+    info = path.lstat()
+    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid():
+        raise ValueError(f"refusing to replace a non-socket or foreign socket at {path}")
+    return info.st_dev, info.st_ino
+
+
+def unlink_same(path, original):
+    try:
+        if identity(path) == original:
+            path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+@contextmanager
+def listener(path):
+    private_parent(path)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+        server.bind(str(path))  # Leave any pre-existing file or listener untouched.
+        original = identity(path)
+        try:
+            os.chmod(path, 0o600)
+            server.listen(8)
+            server.settimeout(0.25)
+            yield server
+        finally:
+            unlink_same(path, original)
+
+
+def serve(server, config, stop):
+    slots = threading.BoundedSemaphore(4)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        while not stop.is_set():
+            try:
+                peer, _ = server.accept()
+            except TimeoutError:
+                continue
+            if slots.acquire(blocking=False):
+                pool.submit(serve_peer, peer, config, slots)
+            else:
+                # Refuse before reading an action or invoking the provider.
+                with peer, suppress(OSError):
+                    send(peer, {"ok": False, "refused": "worker is busy"})
+
+
+def hold_forward(path):
+    """Controller-side guard; stdin lives for the lifetime of this SSH master."""
+    private_parent(path)
+    lock = os.open(path.with_name("." + path.name + ".rccd.lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(lock, "r+b") as owner:
+        info = os.fstat(owner.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise ValueError("invalid controller socket lock")
+        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            prior = identity(path)
+        except FileNotFoundError:
+            prior = None
+        if prior is not None:
+            # Some sshds leave a pathname when a client vanishes. Only a refused
+            # connection proves that an existing Unix socket has no listener.
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.settimeout(1)
+                try:
+                    probe.connect(str(path))
+                except OSError as exc:
+                    if exc.errno != errno.ECONNREFUSED:
+                        raise
+                else:
+                    raise ValueError("controller path already has a live listener")
+            unlink_same(path, prior)
+        sys.stdout.buffer.write(READY)
+        sys.stdout.buffer.flush()
+        if sys.stdin.buffer.readline(16) != b"bound\n":
+            return
+        bound = identity(path)
+        try:
+            sys.stdout.buffer.write(BOUND)
+            sys.stdout.buffer.flush()
+            sys.stdin.buffer.read(1)
+        finally:
+            unlink_same(path, bound)
+
+
+def greeting(process, expected, stop):
+    deadline = time.monotonic() + 18
+    received = bytearray()
+    while not stop.is_set() and time.monotonic() < deadline:
+        if select.select([process.stdout], [], [], 0.25)[0]:
+            part = os.read(process.stdout.fileno(), 128)
+            received.extend(part)
+            if received == expected:
+                return
+            if not part or not expected.startswith(received):
+                break
+    raise ConnectionError("SSH worker guard handshake failed")
+
+
+def ssh_args(control):
+    return ["ssh", "-T", "-S", str(control), "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+            "-o", "ControlPersist=no", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=10",
+            "-o", "ServerAliveCountMax=3", "-o", "ForwardAgent=no", "-o", "ForwardX11=no",
+            "-o", "PermitLocalCommand=no", "-o", "RemoteCommand=none", "-o", "StdinNull=no",
+            "-o", "ForkAfterAuthentication=no", "-o", "ExitOnForwardFailure=yes"]
+
+
+def forward_once(args, local, stop):
+    control = local.parent / "master"
+    common = ssh_args(control)
+    dest = str(args.remote_socket)
+    master_cmd = common + ["-M", "-o", "ClearAllForwardings=yes", "--", args.controller,
+                           str(args.remote_rccd), "_hold-forward", "--socket", dest]
+    fwd = ["-R", dest + ":" + str(local), "--", args.controller]
+    # A user's SSH alias can contain additional LocalForward/RemoteForward entries.
+    # Never establish those as an incidental effect of connecting a worker.
+    config = subprocess.run(common + ["-G", *fwd], stdin=subprocess.DEVNULL, capture_output=True, timeout=9, check=True)
+    mappings = [line for line in config.stdout.decode().splitlines()
+                if line.startswith(("remoteforward ", "localforward ", "dynamicforward "))]
+    if mappings != [f"remoteforward {dest} {local}"]:
+        raise ValueError("SSH alias must have no additional port forwards")
+    with subprocess.Popen(master_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE) as master:
+        try:
+            greeting(master, READY, stop)
+            subprocess.run(common + ["-O", "forward", *fwd], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, timeout=10, check=True)
+            master.stdin.write(b"bound\n")
+            master.stdin.flush()
+            greeting(master, BOUND, stop)
+            print(f"rccd: connected to {args.controller} at {dest}", file=sys.stderr, flush=True)
+            while master.poll() is None and not stop.wait(0.25):
+                pass
+        finally:
+            with suppress(OSError):
+                master.stdin.close()
+            try:
+                master.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                master.terminate()
+                try:
+                    master.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    master.kill()
+
+
+def forward(args, local, stop):
+    delay = 1
+    while not stop.is_set():
+        started = time.monotonic()
+        try:
+            forward_once(args, local, stop)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            if not stop.is_set():
+                print(f"rccd: {exc}", file=sys.stderr, flush=True)
+        if time.monotonic() - started > 45:
+            delay = 1
+        stop.wait(delay)
+        delay = min(30, delay * 2)
+
+
+def main():
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(description=__doc__)
+    actions = parser.add_subparsers(dest="command", required=True)
+    for kind in ("serve", "connect"):
+        cmd = actions.add_parser(kind)
+        cmd.add_argument("--config", required=True, type=Path)
+        cmd.add_argument("--profile", required=True)
+        if kind == "serve":
+            cmd.add_argument("--socket", required=True, type=Path)
+        else:
+            cmd.add_argument("--controller", required=True)
+            cmd.add_argument("--remote-socket", required=True, type=Path)
+            cmd.add_argument("--remote-rccd", default=Path("/usr/local/bin/rccd"), type=Path)
+    guard = actions.add_parser("_hold-forward")
+    guard.add_argument("--socket", required=True, type=Path)
+    args = parser.parse_args()
+    if args.command == "_hold-forward":
+        hold_forward(args.socket)
+        return
+    profile = RCC["read_profiles"](args).get(args.profile)
+    if not profile or profile["driver"] != "docker":
+        raise ValueError("rccd requires a named local profile using the bundled docker driver")
+    config = profile.get("config", {})
+    # Validate the operator's fixed image, entrypoint and limits without contacting Docker.
+    check = RCC["plugin_call"]("docker", config, {"action": "plan", "params": {}}, timeout=5)
+    if check.get("ok") is not True or check.get("dry") is not True:
+        raise ValueError(check.get("refused", "invalid local Docker profile"))
+    stop = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: stop.set())
+    if args.command == "serve":
+        with listener(args.socket) as server:
+            serve(server, config, stop)
+        return
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._@-]{0,127}", args.controller):
+        raise ValueError("provide an SSH host alias")
+    for path in (args.remote_socket, args.remote_rccd):
+        if not re.fullmatch(r"/[a-zA-Z0-9_./-]+", str(path)) or ".." in path.parts:
+            raise ValueError("remote paths must be absolute and contain only SSH-safe path characters")
+    with tempfile.TemporaryDirectory(prefix="rccd-", dir="/tmp") as directory:
+        local = Path(directory) / "node.sock"
+        with listener(local) as server:
+            tunnel = threading.Thread(target=forward, args=(args, local, stop))
+            tunnel.start()
+            try:
+                serve(server, config, stop)
+            finally:
+                stop.set()
+                tunnel.join()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        sys.exit(f"rccd: {error}")

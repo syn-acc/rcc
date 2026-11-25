@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Run approved workers on existing UP SkyPilot clusters using skypilot==0.14.3."""
+
+import contextlib
+import importlib.metadata
+import json
+import os
+import re
+import shlex
+import signal
+import sys
+import uuid
+from urllib.parse import urlsplit
+
+from _managed_job import Problem, params_for, serve
+
+
+VERSION = "0.14.3"
+STATES = {"INIT": "running", "PENDING": "running", "SETTING_UP": "running", "RUNNING": "running",
+          "SUCCEEDED": "done", "FAILED": "failed", "FAILED_DRIVER": "failed",
+          "FAILED_SETUP": "failed", "CANCELLED": "failed"}
+RECEIPT = re.compile(r"([1-9][0-9]{0,15})\.([a-f0-9]{32})")
+
+
+def settings(config):
+    cluster, scope = config.get("cluster"), config.get("scope")
+    if not isinstance(cluster, str) or not re.fullmatch(r"[a-z][a-z0-9-]{0,60}[a-z0-9]|[a-z]", cluster):
+        raise Problem("configure the name of an existing SkyPilot cluster")
+    if not isinstance(scope, str) or not re.fullmatch(r"[a-z][a-z0-9-]{0,19}", scope):
+        raise Problem("scope must be a distinct lowercase job prefix of at most 20 characters")
+    command = config.get("command")
+    if (not isinstance(command, list) or not 1 <= len(command) <= 32
+            or not all(isinstance(a, str) and len(a) <= 4096 and "\0" not in a for a in command)
+            or not command[0].startswith("/")):
+        raise Problem("command must be fixed argv starting with the absolute worker executable on the cluster")
+    seconds, cpus = config.get("timeout_seconds"), config.get("cpus", 1)
+    if type(seconds) is not int or not 1 <= seconds <= 604800 or type(cpus) is not int or cpus < 1:
+        raise Problem("configure timeout_seconds (1 to 604800) and a positive CPU count")
+    accelerators = config.get("accelerators")
+    if accelerators is not None and (not isinstance(accelerators, str) or
+            not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*(?::[1-9][0-9]*)?", accelerators)):
+        raise Problem("accelerators must be a SkyPilot accelerator name with an optional integer count")
+    return cluster, scope, command, seconds, cpus, accelerators
+
+
+def load_sdk():
+    try:
+        if importlib.metadata.version("skypilot") != VERSION:
+            raise Problem(f"online operations require skypilot=={VERSION}")
+        # No implicit local control plane and no SDK usage reporting.
+        os.environ["SKYPILOT_DISABLE_LOCAL_API_SERVER"] = "1"
+        os.environ["SKYPILOT_DISABLE_USAGE_COLLECTION"] = "1"
+        import sky
+        from sky.server import rest
+        return sky, rest
+    except (importlib.metadata.PackageNotFoundError, ImportError):
+        raise Problem(f"install skypilot=={VERSION} for the provider's Python interpreter")
+
+
+def submit_once(sky, rest, task, cluster):
+    # The pinned SDK retries even POST /exec on HTTP 503. Its authenticated request uses
+    # this transport. Keep SDK auth/serialization and disable replay and redirects for that POST.
+    original = rest.request
+
+    def transport(method, url, **kwargs):
+        if method == "POST" and urlsplit(url).path.rstrip("/").endswith("/exec"):
+            kwargs["allow_redirects"] = False
+            return rest.request_without_retry(method, url, **kwargs)
+        return original(method, url, **kwargs)
+
+    rest.request = transport
+    try:
+        # exec skips provisioning/setup and refuses stopped or missing clusters.
+        return sky.exec(task, cluster_name=cluster, down=False)
+    finally:
+        rest.request = original
+
+
+def online(sky, rest, request, profile):
+    cluster, scope, command, seconds, cpus, accelerators = profile
+    if request["action"] == "run":
+        token = uuid.uuid4().hex
+        name = "rcc-" + scope + "-" + token
+        params = json.dumps(params_for(request), separators=(",", ":"), allow_nan=False)
+        worker = shlex.join(["/usr/bin/timeout", "--kill-after=10s", f"{seconds}s", *command])
+        try:
+            resources = sky.Resources(cpus=str(cpus), accelerators=accelerators)
+            task = sky.Task(name=name, run=worker, envs={"RCC_PARAMS_JSON": params},
+                            resources=resources, num_nodes=1, api_server_access=False)
+        except Exception:
+            raise Problem("SkyPilot rejected the configured worker or resource requirements")
+        try:
+            request_id = submit_once(sky, rest, task, cluster)
+            job_id, _ = sky.get(request_id)
+            if type(job_id) is not int or job_id < 1:
+                raise ValueError("missing cluster job ID")
+        except (sky.exceptions.ClusterDoesNotExist, sky.exceptions.ClusterNotUpError):
+            raise Problem("the configured SkyPilot cluster is missing or not UP")
+        except Exception:
+            raise Problem(f"SkyPilot submission outcome unknown; check sky queue {cluster} for {name} "
+                          f"before retrying. Its RCC result ID is JOB_NUMBER.{token}.", True)
+        return {"ok": True, "stride": {"id": f"{job_id}.{token}", "status": "running",
+                "cluster_job_id": job_id, "job_name": name, "provider_status": "SUBMITTED"}}
+
+    receipt = request.get("id")
+    match = RECEIPT.fullmatch(receipt) if isinstance(receipt, str) else None
+    if not match:
+        raise Problem("result expects the cluster job number and RCC receipt suffix")
+    job_id, token = int(match.group(1)), match.group(2)
+    try:
+        rows = sky.get(sky.queue(cluster_name=cluster, skip_finished=False, all_users=False))
+    except Exception:
+        raise Problem("could not read the user's job queue on the configured SkyPilot cluster")
+    name = "rcc-" + scope + "-" + token
+    job = next((row for row in rows if row.get("job_id") == job_id and row.get("job_name") == name), None)
+    if job is None:
+        raise Problem("job does not match this cluster, user, scope and receipt")
+    phase = job.get("status")
+    phase = getattr(phase, "value", phase)
+    if phase not in STATES:
+        raise Problem("SkyPilot reported an unknown job state")
+    stride = {"id": receipt, "status": STATES[phase], "provider_status": phase,
+              "cluster_job_id": job_id, "job_name": name, "logs_command": ["sky", "logs", cluster, str(job_id)]}
+    if stride["status"] in ("done", "failed"):
+        tail = b""
+        try:
+            lines = sky.tail_logs(cluster_name=cluster, job_id=job_id, follow=False, tail=8, preload_content=False)
+            for line in lines:
+                if line:
+                    tail = (tail + line[-8192:].encode("utf-8"))[-8192:]
+            stride["logs_tail"] = tail.decode("utf-8", "replace").rstrip()
+        except Exception:
+            stride["logs_error"] = "SkyPilot job logs are currently unavailable"
+    return {"ok": True, "stride": stride}
+
+
+def deadline(signum, frame):
+    raise TimeoutError("SkyPilot control-plane deadline")
+
+
+def handle(request):
+    profile = settings(request["config"])
+    cluster, scope, _, seconds, cpus, accelerators = profile
+    if request["action"] == "status":
+        return {"ok": True, "description": {"workload": "cluster-job", "cluster": cluster,
+                "scope": scope, "timeout_seconds": seconds, "cpus": cpus, "accelerators": accelerators,
+                "check": "local configuration", "requires": f"UP cluster, approved worker, GNU timeout, skypilot=={VERSION}"}}
+    if request["action"] == "plan":
+        return {"ok": True, "dry": True, "params": params_for(request)}
+    # Leave enough time to return the unique job name on an inconclusive submission.
+    signal.signal(signal.SIGALRM, deadline)
+    signal.alarm(28)
+    try:
+        # SDK diagnostics must not become part of the JSON protocol.
+        with open(os.devnull, "w") as quiet, contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
+            return online(*load_sdk(), request, profile)
+    finally:
+        signal.alarm(0)
+
+
+if __name__ == "__main__":
+    sys.exit(serve(handle))

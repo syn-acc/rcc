@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Submit a private, versioned Kaggle notebook using the official KernelsApiService wire format."""
+
+import base64
+import hashlib
+import http.client
+import json
+import os
+import re
+import stat
+import uuid
+from urllib.parse import urlsplit
+
+from _managed_job import Problem, credential, params_for, serve, token_name
+
+
+STATES = {"QUEUED": "running", "NEW_SCRIPT": "running", "RUNNING": "running", "COMPLETE": "done",
+          "ERROR": "failed", "CANCEL_REQUESTED": "running", "CANCEL_ACKNOWLEDGED": "failed"}
+SCRIPT_LIMIT = 524_288
+
+
+def settings(config):
+    owner, scope = config.get("owner"), config.get("scope")
+    if not isinstance(owner, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,49}", owner):
+        raise Problem("owner must be a Kaggle username")
+    if not isinstance(scope, str) or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,10}[a-z0-9])?", scope):
+        raise Problem("scope must be a stable lowercase slug of up to 12 characters")
+    script, digest = config.get("script"), config.get("script_sha256")
+    if not isinstance(script, str) or not os.path.isabs(script) or "\0" in script:
+        raise Problem("script must be an absolute path to the operator's Python worker")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise Problem("script_sha256 must be the worker's SHA-256 digest")
+    timeout, internet = config.get("timeout_seconds"), config.get("enable_internet", False)
+    if type(timeout) is not int or not 1 <= timeout <= 43200 or type(internet) is not bool:
+        raise Problem("configure timeout_seconds (1–43200) and an optional boolean enable_internet")
+    shape = config.get("machine_shape")
+    if shape is not None and (not isinstance(shape, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", shape)):
+        raise Problem("machine_shape must be a Kaggle accelerator ID")
+    token_name(config, "KAGGLE_API_TOKEN")
+    return owner, scope, timeout, internet, shape
+
+
+def worker_source(config):
+    try:
+        fd = os.open(config["script"], os.O_RDONLY | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as file:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise Problem("script must be a regular file")
+            raw = file.read(SCRIPT_LIMIT + 1)
+    except OSError:
+        raise Problem("cannot read the approved Kaggle worker")
+    if not raw or len(raw) > SCRIPT_LIMIT or hashlib.sha256(raw).hexdigest() != config["script_sha256"]:
+        raise Problem("worker is empty, larger than 512 KiB, or does not match script_sha256")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Problem("worker must be UTF-8 Python source")
+
+
+def notebook(source, params):
+    encoded = base64.b64encode(json.dumps(params, allow_nan=False, separators=(",", ":")).encode()).decode("ascii")
+    setup = ('import os, base64\nos.environ["RCC_PARAMS_JSON"] = '
+             f'base64.b64decode("{encoded}").decode("utf-8")')
+    cells = [{"cell_type": "code", "metadata": {}, "execution_count": None, "outputs": [], "source": code}
+             for code in (setup, source)]
+    return json.dumps({"nbformat": 4, "nbformat_minor": 4, "metadata": {
+        "kernelspec": {"name": "python3", "display_name": "Python 3", "language": "python"}}, "cells": cells})
+
+
+def rpc(method, payload, key):
+    # The official SDK uses POST for reads and writes. A direct connection does not follow redirects or retry.
+    submit = method == "SaveKernel"
+    connection = http.client.HTTPSConnection("api.kaggle.com", timeout=18)
+    try:
+        connection.request("POST", "/v1/kernels.KernelsApiService/" + method,
+                           body=json.dumps(payload).encode(),
+                           headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+        response = connection.getresponse()
+        status = response.status
+        if 200 <= status < 300:
+            raw = response.read(65_537)
+            if len(raw) > 65_536:
+                raise Problem("Kaggle response exceeds 64 KiB", submit)
+            result = json.loads(raw)
+            if not isinstance(result, dict):
+                raise ValueError("expected Kaggle result object")
+            if type(result.get("code")) is not int or result["code"] < 400:
+                return result
+            status = result["code"]
+        raise Problem(f"Kaggle service returned status {status}", submit and (300 <= status < 400 or status == 408 or status >= 500))
+    except (ValueError, OSError, http.client.HTTPException, RecursionError):
+        raise Problem("Kaggle reply was unavailable or invalid", submit)
+    finally:
+        connection.close()
+
+
+def handle(request):
+    config, action = request["config"], request["action"]
+    owner, scope, timeout, internet, shape = settings(config)
+    if action == "result":
+        parts = request.get("id", "").split("/") if isinstance(request.get("id"), str) else []
+        if (len(parts) != 3 or parts[0] != owner or not re.fullmatch(r"rcc-" + re.escape(scope) + r"-[0-9a-f]{24}", parts[1])
+                or parts[2] != "1"):
+            raise Problem("expected a versioned RCC notebook ID from this Kaggle owner and scope")
+        _, slug, version = parts
+        reply = rpc("GetKernelSessionStatus", {"userName": owner, "kernelSlug": slug, "versionLabel": "v" + version},
+                    credential(config, "KAGGLE_API_TOKEN"))
+        # The official protobuf's default enum is QUEUED and its JSON representation may omit that field.
+        stage = reply.get("status", "QUEUED")
+        if not isinstance(stage, str) or stage.upper() not in STATES:
+            raise Problem("unrecognized Kaggle notebook status")
+        state = STATES[stage.upper()]
+    else:
+        source = worker_source(config)
+        if action == "status":
+            return {"ok": True, "description": {"workload": "managed-job", "check": "local configuration and script digest",
+                    "what": "Run the fixed Python worker as a private Kaggle notebook with RCC_PARAMS_JSON.",
+                    "timeout_seconds": timeout, "enable_internet": internet, "machine_shape": shape or "CPU"}}
+        params = params_for(request)
+        if action == "plan":
+            return {"ok": True, "dry": True, "params": params}
+        slug = f"rcc-{scope}-{uuid.uuid4().hex[:24]}"
+        ref = f"{owner}/{slug}"
+        payload = {"slug": ref, "newTitle": slug, "language": "python", "kernelType": "notebook",
+                   "isPrivate": True, "enableInternet": internet, "enableGpu": False, "enableTpu": False,
+                   "sessionTimeoutSeconds": timeout, "kernelExecutionType": "SAVE_AND_RUN_ALL", "text": notebook(source, params)}
+        if shape:
+            payload["machineShape"] = shape
+            payload["enableTpu"] = shape.lower().startswith("tpu")
+        key = credential(config, "KAGGLE_API_TOKEN")
+        try:
+            reply = rpc("SaveKernel", payload, key)
+        except Problem as exc:
+            if exc.ambiguous:
+                raise Problem(f"{exc}; check private notebook {ref} before resubmission", True)
+            raise
+        if reply.get("error"):
+            raise Problem(f"Kaggle rejected the save for {ref}")
+        url = urlsplit(reply.get("url") or "")
+        correct_url = (url.hostname in ("www.kaggle.com", "kaggle.com") and url.scheme == "https"
+                       and url.path.rstrip("/") in ("/code/" + ref, "/" + ref))
+        if (type(reply.get("versionNumber")) is not int or reply["versionNumber"] != 1
+                or (reply.get("ref") != ref and not correct_url) or (reply.get("ref") and reply["ref"] != ref)):
+            raise Problem(f"Kaggle did not confirm version 1 for {ref}; check the private notebook", True)
+        version, stage, state = "1", "SUBMITTED", "running"
+    ref = f"{owner}/{slug}"
+    url = f"https://www.kaggle.com/code/{ref}/versions/{version}"
+    return {"ok": True, "stride": {"id": f"{ref}/{version}", "status": state, "provider_status": stage,
+                                   "result_ref": url, "artifact_ref": f"{ref}/versions/{version}"}}
+
+
+if __name__ == "__main__":
+    raise SystemExit(serve(handle))

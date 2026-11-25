@@ -27,15 +27,15 @@ def plugin_files(directory):
 def payload(root):
     # Read once so installation uses precisely the bytes that were hashed. Reject links and devices.
     files = {}
-    for path in (root / "rcc", *plugin_files(root / "plugins")):
+    for path in (root / "rcc", root / "rccd", *plugin_files(root / "plugins")):
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as stream:
             mode = os.fstat(fd).st_mode
             if not stat.S_ISREG(mode):
                 raise ValueError(f"expected a regular file at {path}")
             files[path.relative_to(root)] = (bool(mode & 0o111), stream.read())
-    if not files[Path("rcc")][0]:
-        raise ValueError("source rcc must be executable")
+    if not all(files[Path(name)][0] for name in ("rcc", "rccd")):
+        raise ValueError("source rcc and rccd must be executable")
     return files
 
 
@@ -69,7 +69,7 @@ def write_release(release, files):
 def verify_release(release, digest):
     if not stat.S_ISDIR(release.lstat().st_mode):
         raise ValueError(f"expected a release directory at {release}")
-    if {p.name for p in release.iterdir()} != {"rcc", "plugins"}:
+    if {p.name for p in release.iterdir()} != {"rcc", "rccd", "plugins"}:
         raise ValueError(f"unexpected entries in release {release}")
     for directory, dirs, files in os.walk(release):
         for name in [".", *dirs, *files]:
@@ -96,9 +96,16 @@ def install(target, digest, files):
         else:
             write_release(release, files)
         with tempfile.TemporaryDirectory(prefix=".rcc-switch-", dir=target.parent) as temp:
-            link = Path(temp) / "rcc"
-            link.symlink_to(os.path.relpath(release.resolve() / "rcc", target.parent.resolve()))
-            os.replace(link, target)
+            daemon = target.with_name(target.name + "d")
+            if os.path.lexists(daemon) and not (daemon.is_symlink() and
+                    daemon.resolve().name == "rccd" and daemon.resolve().parent.parent == versions.resolve()):
+                raise ValueError(f"an unrelated file occupies {daemon}")
+            if target.is_dir():
+                raise ValueError(f"expected a client executable at {target}")
+            for name, dest in (("rccd", daemon), ("rcc", target)):
+                link = Path(temp) / name
+                link.symlink_to(os.path.relpath(release.resolve() / name, target.parent.resolve()))
+                os.replace(link, dest)
     finally:
         os.close(fd)
 

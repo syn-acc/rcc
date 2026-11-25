@@ -31,6 +31,7 @@ def arguments():
     parser = argparse.ArgumentParser(description=__doc__, parents=[connection])
     actions = parser.add_subparsers(dest="command", required=True)
     actions.add_parser("providers", parents=[connection], help="list installed drivers and configured profiles offline")
+    actions.add_parser("nodes", parents=[connection], help="check the reachability of configured rccd workers")
     status = actions.add_parser("status", parents=[connection], help="show the resident broker or inspect one provider")
     status.add_argument("--provider", help="inspect one provider profile")
     for name, summary in (("plan", "ask the broker to check an experiment without starting it"),
@@ -59,6 +60,10 @@ def read_params(path):
     if not isinstance(params, dict):
         raise ValueError("--params must contain a JSON object")
     return params
+
+
+class UnknownRunOutcome(ValueError):
+    """The request may have reached the compute backend."""
 
 
 def exchange(path, request, launching, timeout=TIMEOUT):
@@ -97,7 +102,7 @@ def exchange(path, request, launching, timeout=TIMEOUT):
             return reply
         except (OSError, ValueError, RecursionError) as exc:
             if launching:
-                raise ValueError(f"run outcome unknown ({exc}); check rcc status before submitting again") from exc
+                raise UnknownRunOutcome(f"run outcome unknown ({exc}); check rcc status before submitting again") from exc
             raise
 
 
@@ -183,7 +188,16 @@ def qualify(profile, stride):
 def profile_call(name, profile, request, timeout=TIMEOUT):
     driver, config = profile["driver"], profile.get("config", {})
     action = request["action"]
-    if driver in ("colab", "ruuf-broker"):
+    if driver == "rccd":
+        path = config.get("socket")
+        if not isinstance(path, str) or not Path(path).is_absolute():
+            raise ValueError(f"{name}: rccd requires an absolute controller socket path")
+        try:
+            reply = exchange(path, {"protocol": 1, **request}, action == "run", timeout)
+        except UnknownRunOutcome:
+            return {"ok": False, "ambiguous": True,
+                    "refused": f"run outcome unknown; check rcc status --provider {name} before submitting again"}
+    elif driver in ("colab", "ruuf-broker"):
         path = config.get("socket", "/run/ruu-legs.sock")
         kind = "colab" if driver == "colab" else config.get("kind", "colab")
         if not isinstance(path, str) or not Path(path).is_absolute() or not isinstance(kind, str):
@@ -261,13 +275,32 @@ def resident_status(path, profiles):
     return {**reply, "ok": True, "provider_errors": errors}
 
 
+def node_status(profiles):
+    nodes = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        checks = {name: pool.submit(profile_call, name, profile, {"action": "status"}, 6)
+                  for name, profile in profiles.items() if profile["driver"] == "rccd"}
+        for name, check in checks.items():
+            try:
+                reply = check.result()
+                if not reply["ok"]:
+                    raise ValueError(reply.get("refused", "worker refused status"))
+                nodes[name] = {"online": True, "description": reply["description"],
+                               "running": len(reply["running"])}
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                nodes[name] = {"online": False, "error": str(exc)}
+    return {"ok": all(node["online"] for node in nodes.values()), "nodes": nodes}
+
+
 def dispatch(args):
     profiles = read_profiles(args)
     path = getattr(args, "socket", None) or os.environ.get("RCC_SOCKET") or "/run/ruu-legs.sock"
+    if args.command == "nodes":
+        return node_status(profiles)
     if args.command == "providers":
         installed = sorted(p.name for p in PLUGIN_DIR.glob("*")
                            if NAME.fullmatch(p.name) and p.is_file() and os.access(p, os.X_OK))
-        return {"ok": True, "drivers": ["colab", "ruuf-broker", *installed],
+        return {"ok": True, "drivers": ["colab", "ruuf-broker", "rccd", *installed],
                 "profiles": {"colab": {"driver": "colab", "resident": True},
                              **{k: {"driver": p["driver"], "resident": p.get("resident", False)} for k, p in profiles.items()}}}
     name = getattr(args, "provider", None)

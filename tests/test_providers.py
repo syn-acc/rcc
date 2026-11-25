@@ -81,3 +81,33 @@ print(json.dumps({"ok": True, **body}))
         self.assertIn("two", status["provider_errors"])
         self.assertEqual([json.loads(r)["action"] for r in calls.read_text().splitlines()],
                          ["run", "result", "run", "status"])
+
+    def test_node_disconnect_and_lost_submit_receipt(self):
+        self.config.write_text(json.dumps({"providers": {
+            "bench": {"driver": "rccd", "config": {"socket": self.socket}},
+            "away": {"driver": "rccd", "config": {"socket": str(self.root / "offline")}},
+        }}))
+        requests = []
+        with socket.socket(socket.AF_UNIX) as server:
+            server.bind(self.socket)
+            server.listen()
+            server.settimeout(5)
+
+            def worker():
+                for reply in ({"ok": True, "description": {"workload": "container-job"}}, None):
+                    peer, _ = server.accept()
+                    with peer, peer.makefile("rb") as stream:
+                        requests.append(json.load(stream))
+                        if reply:
+                            peer.sendall(json.dumps(reply).encode())
+
+            thread = threading.Thread(target=worker, daemon=True)
+            thread.start()
+            nodes = self.cli("nodes", ok=False)["nodes"]
+            self.assertTrue(nodes["bench"]["online"])
+            self.assertFalse(nodes["away"]["online"])
+            lost = self.cli("run", "--provider", "bench", "--params", str(self.params), ok=False)
+            self.assertTrue(lost["ambiguous"])
+            thread.join(5)
+            self.assertEqual(requests, [{"protocol": 1, "action": "status"},
+                                        {"protocol": 1, "action": "run", "params": {"seed": 7}}])

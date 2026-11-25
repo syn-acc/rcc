@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""RCC protocol 1 provider for a namespaced Kubernetes batch/v1 Job."""
+
+import json
+import re
+import subprocess
+import uuid
+
+from _managed_job import Problem, params_for, serve
+
+
+DNS_LABEL = r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?"
+LABEL_VALUE = r"[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?"
+JOB_NAME = r"rcc-[0-9a-f]{32}"
+UID = r"[A-Za-z0-9][-A-Za-z0-9_.]{0,61}[A-Za-z0-9]"
+
+
+def matches(pattern, value):
+    return isinstance(value, str) and re.fullmatch(pattern, value) is not None
+
+
+def bounded(config, key, default, minimum, maximum):
+    value = config.get(key, default)
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise Problem(f"{key} must be an integer from {minimum} to {maximum}")
+    return value
+
+
+def profile(config):
+    context, namespace, scope = config.get("context"), config.get("namespace"), config.get("scope")
+    if not isinstance(context, str) or not context.strip() or not context.isprintable() or len(context) > 512:
+        raise Problem("context must be a configured kubectl context name")
+    if not matches(DNS_LABEL, namespace) or not matches(LABEL_VALUE, scope):
+        raise Problem("configure a Kubernetes namespace and a stable scope label")
+    image, command = config.get("image"), config.get("command")
+    if not matches(r"[a-z0-9][a-zA-Z0-9_./:-]*@sha256:[0-9a-f]{64}", image):
+        raise Problem("image must be pinned by repository and sha256 digest")
+    if not isinstance(command, list) or not 1 <= len(command) <= 64 or not command[0] or not all(
+        isinstance(arg, str) and "\0" not in arg and len(arg) <= 4096 for arg in command
+    ):
+        raise Problem("command must be a fixed, nonempty argument array")
+    timeout = bounded(config, "timeout_seconds", None, 1, 2**31 - 1)
+    resources = {"cpu": f"{bounded(config, 'cpu_millis', 1000, 1, 1024000)}m",
+                 "memory": f"{bounded(config, 'memory_mib', 512, 1, 16777216)}Mi"}
+    gpus = bounded(config, "gpus", 0, 0, 1024)
+    if gpus or "gpu_resource" in config:
+        device = config.get("gpu_resource", "nvidia.com/gpu")
+        domain, _, resource = device.partition("/") if isinstance(device, str) else ("", "", "")
+        if (not gpus or len(domain) > 253 or "." not in domain or not all(matches(DNS_LABEL, p) for p in domain.split("."))
+                or domain == "kubernetes.io" or domain.endswith(".kubernetes.io") or not matches(LABEL_VALUE, resource)):
+            raise Problem("GPU requests need a positive gpus count and a vendor-qualified gpu_resource")
+        resources[device] = str(gpus)
+    return context, namespace, {"app.kubernetes.io/managed-by": "rcc", "app.kubernetes.io/instance": scope}, {
+        "image": image, "command": command, "resources": resources, "deadline": timeout,
+    }
+
+
+def job_manifest(namespace, labels, worker, name, params):
+    # Kubernetes expands $(VAR) in literal env values and argv. Double dollars survive as literal dollars.
+    payload = json.dumps(params, allow_nan=False, separators=(",", ":")).replace("$", "$$")
+    container = {"name": "worker", "image": worker["image"],
+                 "command": [arg.replace("$", "$$") for arg in worker["command"]],
+                 "env": [{"name": "RCC_PARAMS_JSON", "value": payload}],
+                 "resources": {"requests": worker["resources"], "limits": worker["resources"]}}
+    return {"apiVersion": "batch/v1", "kind": "Job", "metadata": {"name": name, "namespace": namespace, "labels": labels},
+            "spec": {"backoffLimit": 0, "parallelism": 1, "completions": 1, "activeDeadlineSeconds": worker["deadline"],
+                     "template": {"metadata": {"labels": labels}, "spec": {"restartPolicy": "Never",
+                                  "automountServiceAccountToken": False, "enableServiceLinks": False,
+                                  "containers": [container]}}}}
+
+
+def kubectl(context, namespace, name, manifest=None):
+    path = f"/apis/batch/v1/namespaces/{namespace}/jobs"
+    args = ["kubectl", f"--context={context}", f"--namespace={namespace}", "--request-timeout=12s"]
+    submit = manifest is not None
+    # --raw with an opaque stdin body avoids discovery and client-go's replay of buffered requests.
+    args.extend(["create", "--raw=" + path, "-f", "-"] if submit else ["get", "--raw=" + path + "/" + name])
+    location = f"{namespace}/{name}"
+    try:
+        reply = subprocess.run(args, input=json.dumps(manifest).encode() if submit else b"",
+                               capture_output=True, timeout=20)
+    except (FileNotFoundError, PermissionError):
+        raise Problem("kubectl is missing or not executable")
+    except (OSError, subprocess.TimeoutExpired):
+        raise Problem(f"no Kubernetes receipt for {location}", submit)
+    if reply.returncode:
+        # Do not echo arbitrary error text from kubeconfig auth plugins or admission webhooks.
+        reason = re.search(rb"Error from server \((Forbidden|Unauthorized|Invalid|BadRequest|NotFound)\)", reply.stderr)
+        if reason:
+            raise Problem(f"Kubernetes refused {location}: {reason[1].decode()}")
+        raise Problem(f"kubectl did not confirm {location}", submit)
+    try:
+        return json.loads(reply.stdout)
+    except (ValueError, RecursionError):
+        raise Problem(f"unreadable Kubernetes receipt for {location}", submit)
+
+
+def handle(request):
+    context, namespace, labels, worker = profile(request["config"])
+    action = request["action"]
+    if action == "status":
+        return {"ok": True, "description": {"workload": "managed-job", "check": "local configuration",
+                "what": "Run the fixed Kubernetes Job worker; params are its RCC_PARAMS_JSON object.",
+                "timeout_seconds": worker["deadline"], "resources": worker["resources"]}}
+    expected_uid = None
+    manifest = None
+    if action == "result":
+        native = request.get("id")
+        parts = native.split("/") if isinstance(native, str) else []
+        if len(parts) != 3 or parts[0] != namespace or not matches(JOB_NAME, parts[1]) or not matches(UID, parts[2]):
+            raise Problem("expected this namespace, RCC Job name and Kubernetes UID")
+        _, name, expected_uid = parts
+    else:
+        params = params_for(request)
+        if action == "plan":
+            return {"ok": True, "dry": True, "params": params}
+        name = "rcc-" + uuid.uuid4().hex
+        manifest = job_manifest(namespace, labels, worker, name, params)
+    obj = kubectl(context, namespace, name, manifest)
+    meta = obj.get("metadata", {}) if isinstance(obj, dict) else {}
+    uid = meta.get("uid")
+    if (not isinstance(obj, dict) or obj.get("kind") != "Job" or obj.get("apiVersion") != "batch/v1"
+            or meta.get("namespace") != namespace or meta.get("name") != name or not matches(UID, uid)
+            or (expected_uid is not None and expected_uid != uid)
+            or not all((meta.get("labels") or {}).get(k) == v for k, v in labels.items())):
+        raise Problem(f"Kubernetes receipt did not match the RCC Job {namespace}/{name}", action == "run")
+    conditions = {c["type"] for c in obj.get("status", {}).get("conditions", []) if c.get("status") == "True"}
+    state = "failed" if "Failed" in conditions else "done" if "Complete" in conditions else "running"
+    ref = {"context": context, "namespace": namespace, "resource": "jobs.batch/" + name, "uid": uid,
+           "log_selector": f"batch.kubernetes.io/controller-uid={uid}", "container": "worker"}
+    return {"ok": True, "stride": {"id": f"{namespace}/{name}/{uid}", "status": state, "result_ref": ref}}
+
+
+if __name__ == "__main__":
+    raise SystemExit(serve(handle))
