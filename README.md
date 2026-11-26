@@ -4,7 +4,7 @@ RCC gives Ruu and its operator one command line for compute. A provider **driver
 
 | Driver | Where the work runs | What comes back |
 | --- | --- | --- |
-| Colab | RUUF’s existing, metered Google Colab training workflow | Baseline comparison and controller-scored results |
+| Colab | Ruu’s metered Google Colab training workflow | Baseline comparison and controller-scored results |
 | Kaggle Notebooks | A private notebook under your Kaggle account, using a pinned Python worker | Versioned notebook URL, run state and output reference |
 | Docker | A local engine or remote Docker context, including a home GPU workstation | Container ID, exit status and bounded stdout |
 | Custom PCs (`rccd`) | One named worker per PC, connected to the controller over outbound SSH | Which PCs are online, plus a job ID and output from the chosen machine |
@@ -16,7 +16,7 @@ RCC gives Ruu and its operator one command line for compute. A provider **driver
 
 `./rcc providers` lists installed drivers and configured profiles without contacting any cloud. `rcc nodes` contacts each configured PC and reports which ones can take requests. Colab is the default profile. Configure another provider with the [setup and plugin guide](PROVIDERS.md).
 
-The Colab provider trains and evaluates an open model on a family of tasks. The worker runs on the rented GPU. RUUF keeps the baseline, scores the answers on the controller and enforces the operator’s compute budget. [How the training experiment works](https://github.com/syn-acc/ruuf/blob/main/ruu-lab/child/README.md)
+The Colab provider trains and evaluates an open model on a family of tasks. The worker runs on the rented GPU. Ruu’s controller keeps the baseline, scores the answers and enforces the operator’s compute budget. [How the training experiment works](https://github.com/syn-acc/scru/blob/main/residents/ruu/ruu-lab/child/README.md)
 
 ## Try Colab
 
@@ -28,7 +28,7 @@ cd rcc
 ./rcc --help
 ```
 
-The following commands need a running RUUF broker and permission to use its Unix socket. The default is `/run/ruu-legs.sock`. Set `RCC_SOCKET` or pass `--socket PATH` for another instance.
+The following commands need a running Colab broker and permission to use its Unix socket. The default is `/run/ruu-legs.sock`. Set `RCC_SOCKET` or pass `--socket PATH` for another instance.
 
 ```sh
 ./rcc status
@@ -75,4 +75,4 @@ rcc result home:NATIVE_ID
 
 A profile-qualified ID goes back to the provider that issued it. Existing Colab IDs continue to work as before. If a submission loses its receipt, check the provider’s job list before resubmitting.
 
-For a system install, run `sudo python3 install.py` from the checkout. This installs `rcc`, `rccd` and the bundled drivers together. [RUUF](https://github.com/syn-acc/ruuf) owns the resident’s research loop, GPU budget and held-out scoring.
+For a system install, run `sudo python3 install.py` from the checkout. This installs `rcc`, `rccd` and the bundled drivers together. Ruu’s research loop and training services live with the resident in SCRU. [Ruu’s source](https://github.com/syn-acc/scru/tree/main/residents/ruu)

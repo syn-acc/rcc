@@ -1,6 +1,6 @@
 # Compute providers
 
-Store named profiles in `/etc/rcc/providers.json`, or point `--config FILE` or `RCC_CONFIG` at an operator-owned file. The default Colab profile already talks to RUUF’s broker on `/run/ruu-legs.sock`. Its credentials, spending rules and scorer stay with RUUF. [Colab broker](https://github.com/syn-acc/ruuf/blob/main/ruu-lab/legs/runner.py)
+Store named profiles in `/etc/rcc/providers.json`, or point `--config FILE` or `RCC_CONFIG` at an operator-owned file. The default Colab profile connects to Ruu’s broker on `/run/ruu-legs.sock`. Ruu’s deployment holds the Colab credentials, enforces spending limits and scores the results. [Colab broker](https://github.com/syn-acc/scru/blob/main/residents/ruu/ruu-lab/legs/runner.py)
 
 ## Connect a PC with rccd
 
@@ -126,6 +126,6 @@ Return `{"ok":false,"refused":"reason"}` for a refusal. Include `"ambiguous":tru
 
 ## Enroll a training provider for Ruu
 
-Ordinary jobs are available by explicit profile name. On scheduled OpenRSI turns, Ruu needs a provider that can enforce a compute budget, run the training workload and return controller-scored evidence. The default Colab broker already does this. An additional profile must opt in with `"resident": true` and advertise `workload: "ruuf.openrsi.v1"`, `families` and `params` dictionaries in its status description. Its run records must follow the existing RUUF training contract, including the parameters, reason, start time and scored arms. The controller evaluates returned predictions against its own held-out answers. [RUUF’s training and scoring contract](https://github.com/syn-acc/ruuf/blob/main/ruu-lab/child/README.md)
+Ordinary jobs are available by explicit profile name. On scheduled OpenRSI turns, Ruu needs a provider that can enforce a compute budget, run the training workload and return controller-scored evidence. The default Colab broker already does this. An additional profile must opt in with `"resident": true` and advertise `workload: "ruuf.openrsi.v1"`, `families` and `params` dictionaries in its status description. Its run records must follow Ruu’s training contract, including the parameters, reason, start time and scored arms. The controller evaluates returned predictions against its own held-out answers. [Ruu’s training and scoring contract](https://github.com/syn-acc/scru/blob/main/residents/ruu/ruu-lab/child/README.md)
 
 Use the bundled `ruuf-broker` driver to connect a second compatible broker with `config` containing its absolute local `socket` path and upstream `kind`. Give it a distinct profile name. Only enroll an independent compute budget once. `rcc status` discovers enrolled training profiles. `rcc providers` lists all configured profiles.
