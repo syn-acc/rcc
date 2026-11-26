@@ -289,7 +289,7 @@ def node_status(profiles):
                                "running": len(reply["running"])}
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 nodes[name] = {"online": False, "error": str(exc)}
-    return {"ok": all(node["online"] for node in nodes.values()), "nodes": nodes}
+    return {"ok": bool(nodes) and all(node["online"] for node in nodes.values()), "nodes": nodes}
 
 
 def dispatch(args):
